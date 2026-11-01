@@ -1,4 +1,7 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::telemetry::{MuObserveRegistrySink, RegistryTelemetrySink};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -8,6 +11,8 @@ pub struct AppConfig {
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
     pub listen_addr: String,
+    pub node_id: String,
+    pub telemetry_sink: Arc<dyn RegistryTelemetrySink>,
 }
 
 impl Default for AppConfig {
@@ -19,6 +24,8 @@ impl Default for AppConfig {
             tls_cert_path: PathBuf::from("/etc/muregist/tls/server.crt"),
             tls_key_path: PathBuf::from("/etc/muregist/tls/server.key"),
             listen_addr: "0.0.0.0:8444".to_string(),
+            node_id: "node-a".to_string(),
+            telemetry_sink: Arc::new(MuObserveRegistrySink::from_env()),
         }
     }
 }
@@ -31,6 +38,20 @@ impl AppConfig {
             base_url: base_url.into(),
             ..Default::default()
         }
+    }
+
+    /// Attaches a custom [`RegistryTelemetrySink`] for OpenTelemetry span and audit log emission.
+    #[must_use]
+    pub fn with_telemetry_sink(mut self, sink: Arc<dyn RegistryTelemetrySink>) -> Self {
+        self.telemetry_sink = sink;
+        self
+    }
+
+    /// Sets the logical node identifier emitted on OpenTelemetry records.
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.node_id = node_id.into();
+        self
     }
 
     pub fn catalog_path(&self) -> PathBuf {
