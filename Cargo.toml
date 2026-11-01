@@ -1,0 +1,39 @@
+[package]
+name = "muregist"
+version = "0.1.0"
+edition = "2021"
+description = "Pluggable artifact and package registry with Content-Addressed Storage (CAS), DuckDB metadata catalog, Cargo Sparse HTTP registry front-end, and Canary Release & Integration Test Bundle APIs"
+license = "AGPL-3.0-only"
+repository = "https://github.com/LMA1980/MuRegist"
+
+[features]
+default = []
+bundled-duckdb = ["duckdb/bundled"]
+
+[dependencies]
+duckdb = { version = "=1.2.2", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "signal"] }
+axum = { version = "0.8", features = ["multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+http = "1"
+rustls = "0.23"
+rustls-pki-types = "1"
+x509-parser = "0.18"
+argon2 = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "0.14"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

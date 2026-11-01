@@ -1,0 +1,315 @@
+use sha2::{Digest, Sha256};
+use std::fmt;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Invalid SHA-256 digest: {0}")]
+    InvalidDigest(String),
+
+    #[error("Blob not found: {0}")]
+    NotFound(String),
+
+    #[error("Corrupt blob data for digest: {0}")]
+    CorruptBlob(String),
+
+    #[error("Storage conflict: {0}")]
+    Conflict(String),
+}
+
+/// A validated 64-character lowercase hexadecimal SHA-256 digest string.
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Sha256Digest(String);
+
+impl Sha256Digest {
+    pub fn new(hex_str: &str) -> Result<Self, StorageError> {
+        let trimmed = hex_str.trim();
+        if trimmed.len() != 64 {
+            return Err(StorageError::InvalidDigest(format!(
+                "Expected 64 characters, got {}",
+                trimmed.len()
+            )));
+        }
+        if !trimmed.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+            return Err(StorageError::InvalidDigest(
+                "Digest contains non-hexadecimal or uppercase characters".to_string(),
+            ));
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let result = hasher.finalize();
+        Self(hex::encode(result))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for Sha256Digest {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<str> for Sha256Digest {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Debug for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Sha256Digest({})", self.0)
+    }
+}
+
+impl FromStr for Sha256Digest {
+    type Err = StorageError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl TryFrom<&str> for Sha256Digest {
+    type Error = StorageError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for Sha256Digest {
+    type Error = StorageError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+
+/// Content-Addressed Store backed by filesystem hierarchy.
+/// Layout:
+/// `<root>/blobs/sha256/<hex[0..2]>/<hex>`
+/// `<root>/tmp/upload-<uuid>.part`
+#[derive(Clone, Debug)]
+pub struct CasStore {
+    root_dir: PathBuf,
+}
+
+pub type CasStorage = CasStore;
+
+impl CasStore {
+    pub fn new(root_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            root_dir: root_dir.into(),
+        }
+    }
+
+    pub fn default_path() -> PathBuf {
+        PathBuf::from("/var/lib/muregist")
+    }
+
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.root_dir.join("tmp")
+    }
+
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.root_dir.join("blobs").join("sha256")
+    }
+
+    pub async fn init(&self) -> Result<(), StorageError> {
+        tokio::fs::create_dir_all(self.tmp_dir()).await?;
+        tokio::fs::create_dir_all(self.blobs_dir()).await?;
+        Ok(())
+    }
+
+    pub fn blob_path(&self, digest: &str) -> Result<PathBuf, StorageError> {
+        let validated = Sha256Digest::new(digest)?;
+        let prefix = &validated.as_str()[0..2];
+        Ok(self.blobs_dir().join(prefix).join(validated.as_str()))
+    }
+
+    pub async fn has_blob(&self, digest: &str) -> bool {
+        match self.blob_path(digest) {
+            Ok(path) => tokio::fs::try_exists(path).await.unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    pub async fn get_blob(&self, digest: &str) -> Result<Vec<u8>, StorageError> {
+        let path = self.blob_path(digest)?;
+        if !tokio::fs::try_exists(&path).await? {
+            return Err(StorageError::NotFound(digest.to_string()));
+        }
+
+        let content = tokio::fs::read(&path).await?;
+        let computed = Sha256Digest::from_bytes(&content);
+        if computed.as_str() != digest {
+            return Err(StorageError::CorruptBlob(format!(
+                "Digest mismatch for {}: expected {}, computed {}",
+                path.display(),
+                digest,
+                computed.as_str()
+            )));
+        }
+
+        Ok(content)
+    }
+
+    pub async fn put_blob(&self, bytes: &[u8]) -> Result<Sha256Digest, StorageError> {
+        let digest = Sha256Digest::from_bytes(bytes);
+        let target_path = self.blob_path(digest.as_str())?;
+
+        // Deduplication check: if blob already exists and is intact, avoid rewrites
+        if tokio::fs::try_exists(&target_path).await.unwrap_or(false) {
+            if let Ok(metadata) = tokio::fs::metadata(&target_path).await {
+                if metadata.len() == bytes.len() as u64 {
+                    // Quick check matches, verify contents
+                    if let Ok(existing) = tokio::fs::read(&target_path).await {
+                        if Sha256Digest::from_bytes(&existing) == digest {
+                            return Ok(digest);
+                        }
+                    }
+                }
+            }
+        }
+
+        let tmp_dir = self.tmp_dir();
+        tokio::fs::create_dir_all(&tmp_dir).await?;
+
+        let part_filename = format!("upload-{}.part", Uuid::new_v4());
+        let part_path = tmp_dir.join(part_filename);
+
+        // Scope file write and sync to ensure handle is flushed and closed before rename
+        {
+            let mut file = tokio::fs::File::create(&part_path).await?;
+            file.write_all(bytes).await?;
+            file.sync_all().await?;
+        }
+
+        if let Some(parent) = target_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        // Atomically rename temporary file to target path
+        if let Err(e) = tokio::fs::rename(&part_path, &target_path).await {
+            // Check if concurrent write succeeded
+            if tokio::fs::try_exists(&target_path).await.unwrap_or(false) {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                return Ok(digest);
+            }
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(StorageError::Io(e));
+        }
+
+        Ok(digest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_put_get_deduplication() {
+        let temp_dir = tempdir().unwrap();
+        let store = CasStore::new(temp_dir.path());
+        store.init().await.unwrap();
+
+        let data = b"Hello, MuRegist Content Addressed Storage!";
+        let digest = store.put_blob(data).await.unwrap();
+
+        assert!(store.has_blob(digest.as_str()).await);
+        let retrieved = store.get_blob(digest.as_str()).await.unwrap();
+        assert_eq!(retrieved, data);
+
+        // Put again (idempotent deduplication)
+        let digest2 = store.put_blob(data).await.unwrap();
+        assert_eq!(digest, digest2);
+
+        // Verify no leftover .part files in tmp
+        let mut read_dir = tokio::fs::read_dir(store.tmp_dir()).await.unwrap();
+        let mut part_count = 0;
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            if entry.file_name().to_string_lossy().ends_with(".part") {
+                part_count += 1;
+            }
+        }
+        assert_eq!(part_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_writes_identical_payload() {
+        let temp_dir = tempdir().unwrap();
+        let store = Arc::new(CasStore::new(temp_dir.path()));
+        store.init().await.unwrap();
+
+        let data = b"Concurrent identical payload blob test";
+        let mut handles = Vec::new();
+
+        for _ in 0..10 {
+            let store_clone = Arc::clone(&store);
+            handles.push(tokio::spawn(
+                async move { store_clone.put_blob(data).await },
+            ));
+        }
+
+        for handle in handles {
+            let res = handle.await.unwrap();
+            assert!(res.is_ok());
+        }
+
+        // Verify tmp directory has zero leftover .part files
+        let mut read_dir = tokio::fs::read_dir(store.tmp_dir()).await.unwrap();
+        let mut part_count = 0;
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            if entry.file_name().to_string_lossy().ends_with(".part") {
+                part_count += 1;
+            }
+        }
+        assert_eq!(part_count, 0);
+
+        // Verify blob is intact
+        let digest = Sha256Digest::from_bytes(data);
+        let blob = store.get_blob(digest.as_str()).await.unwrap();
+        assert_eq!(blob, data);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_digest() {
+        let temp_dir = tempdir().unwrap();
+        let store = CasStore::new(temp_dir.path());
+        store.init().await.unwrap();
+
+        assert!(Sha256Digest::new("short").is_err());
+        assert!(Sha256Digest::new(
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+        )
+        .is_err());
+        assert!(!store.has_blob("invalid").await);
+        assert!(store.get_blob("invalid").await.is_err());
+    }
+}
