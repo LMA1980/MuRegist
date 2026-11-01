@@ -1,0 +1,418 @@
+use crate::storage::catalog::{Catalog, DuckDbCatalog, TokenScope};
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use axum::{
+    extract::{FromRef, FromRequestParts},
+    http::{header::AUTHORIZATION, request::Parts, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+use std::sync::Arc;
+use uuid::Uuid;
+use x509_parser::prelude::*;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("TLS configuration error: {0}")]
+    Tls(String),
+
+    #[error("X.509 certificate error: {0}")]
+    X509(String),
+
+    #[error("Password/Token hashing error: {0}")]
+    Hash(String),
+
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        match self {
+            AuthError::Unauthorized(msg) => (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "unauthorized",
+                    "message": msg
+                })),
+            )
+                .into_response(),
+            AuthError::Forbidden(msg) => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "forbidden",
+                    "message": msg
+                })),
+            )
+                .into_response(),
+            other => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "internal_error",
+                    "message": other.to_string()
+                })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Computes SHA-256 lowercase hexadecimal hash of a plaintext token string.
+pub fn hash_token_sha256(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Computes Argon2id hash of a plaintext token string.
+pub fn hash_token_argon2(token: &str) -> Result<String, AuthError> {
+    let random_bytes = Uuid::new_v4().into_bytes();
+    let salt = SaltString::encode_b64(&random_bytes)
+        .map_err(|e| AuthError::Hash(format!("Salt generation failed: {e}")))?;
+    let argon2 = Argon2::default();
+    let hash = argon2
+        .hash_password(token.as_bytes(), &salt)
+        .map_err(|e| AuthError::Hash(e.to_string()))?;
+    Ok(hash.to_string())
+}
+
+/// Extracts SAN (Subject Alternative Names) DNS and URI names from a DER-encoded X.509 certificate.
+pub fn extract_cert_sans(cert_der: &[u8]) -> Result<Vec<String>, AuthError> {
+    let (_, x509) = X509Certificate::from_der(cert_der)
+        .map_err(|e| AuthError::X509(format!("Failed to parse DER certificate: {e}")))?;
+
+    let mut sans = Vec::new();
+    for ext in x509.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+            for name in &san.general_names {
+                match name {
+                    GeneralName::DNSName(dns) => sans.push(dns.to_string()),
+                    GeneralName::URI(uri) => sans.push(uri.to_string()),
+                    GeneralName::RFC822Name(rfc) => sans.push(rfc.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(sans)
+}
+
+/// Build rustls::ServerConfig requiring or verifying mTLS client certificates rooted in step-ca CA bundle.
+pub fn build_tls_server_config(
+    ca_cert_path: impl AsRef<Path>,
+    server_cert_path: impl AsRef<Path>,
+    server_key_path: impl AsRef<Path>,
+) -> Result<rustls::ServerConfig, AuthError> {
+    let ca_file = File::open(ca_cert_path)?;
+    let mut ca_reader = BufReader::new(ca_file);
+    let ca_certs: Vec<CertificateDer<'static>> =
+        rustls_pki_types::CertificateDer::pem_reader_iter(&mut ca_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AuthError::Tls(format!("Failed to parse CA certificate PEM: {e}")))?;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in ca_certs {
+        root_store
+            .add(cert)
+            .map_err(|e| AuthError::Tls(format!("Failed to add CA cert to root store: {e}")))?;
+    }
+
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
+        .build()
+        .map_err(|e| AuthError::Tls(format!("Failed to build client verifier: {e}")))?;
+
+    let srv_file = File::open(server_cert_path)?;
+    let mut srv_reader = BufReader::new(srv_file);
+    let srv_certs: Vec<CertificateDer<'static>> =
+        rustls_pki_types::CertificateDer::pem_reader_iter(&mut srv_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AuthError::Tls(format!("Failed to parse server cert PEM: {e}")))?;
+
+    let key_file = File::open(server_key_path)?;
+    let mut key_reader = BufReader::new(key_file);
+    let key: PrivateKeyDer<'static> =
+        rustls_pki_types::PrivateKeyDer::from_pem_reader(&mut key_reader)
+            .map_err(|e| AuthError::Tls(format!("Failed to parse server private key: {e}")))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(srv_certs, key)
+        .map_err(|e| AuthError::Tls(format!("Failed to configure server cert: {e}")))?;
+
+    Ok(config)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientIdentity {
+    Anonymous,
+    BearerToken(String),
+    CertSan(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub identity: ClientIdentity,
+    pub scopes: HashSet<TokenScope>,
+}
+
+impl AuthContext {
+    pub fn anonymous() -> Self {
+        Self {
+            identity: ClientIdentity::Anonymous,
+            scopes: HashSet::new(),
+        }
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        !matches!(self.identity, ClientIdentity::Anonymous)
+    }
+
+    pub fn has_scope(&self, scope: TokenScope) -> bool {
+        self.scopes.contains(&scope)
+    }
+
+    pub fn require_scope(&self, scope: TokenScope) -> Result<(), AuthError> {
+        if !self.is_authenticated() {
+            return Err(AuthError::Unauthorized(
+                "Authentication credentials required".to_string(),
+            ));
+        }
+        if !self.has_scope(scope) {
+            return Err(AuthError::Forbidden(format!(
+                "Operation requires '{scope}' scope"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Authenticate incoming request using:
+/// 1. Client certificate SAN header (e.g. `X-Client-Cert-SAN` or TLS context) -> grants full administrative scopes.
+/// 2. `Authorization: Bearer <token>` verified against SHA-256 or Argon2id hashes in DuckDbCatalog.
+pub fn authenticate_request(
+    parts: &Parts,
+    catalog: &DuckDbCatalog,
+) -> Result<AuthContext, AuthError> {
+    // 1. Check for verified client certificate SAN
+    if let Some(san_val) = parts.headers.get("x-client-cert-san") {
+        if let Ok(san_str) = san_val.to_str() {
+            let san = san_str.trim();
+            if !san.is_empty() {
+                // Verified mTLS SAN granted all scopes (publish, yank, read, canary:manage)
+                let mut scopes = HashSet::new();
+                scopes.insert(TokenScope::Publish);
+                scopes.insert(TokenScope::Yank);
+                scopes.insert(TokenScope::Read);
+                scopes.insert(TokenScope::CanaryManage);
+
+                return Ok(AuthContext {
+                    identity: ClientIdentity::CertSan(san.to_string()),
+                    scopes,
+                });
+            }
+        }
+    }
+
+    // 2. Check for Bearer token
+    if let Some(auth_val) = parts.headers.get(AUTHORIZATION) {
+        if let Ok(auth_str) = auth_val.to_str() {
+            let trimmed = auth_str.trim();
+            if let Some(raw_token) = trimmed
+                .strip_prefix("Bearer ")
+                .or_else(|| trimmed.strip_prefix("bearer "))
+            {
+                let token = raw_token.trim();
+                let sha_hash = hash_token_sha256(token);
+
+                // Direct SHA-256 lookup
+                if let Ok(Some(tok_rec)) = catalog.find_token_by_hash(&sha_hash) {
+                    let scopes = tok_rec
+                        .scopes()
+                        .map_err(|e| AuthError::Hash(e.to_string()))?;
+                    return Ok(AuthContext {
+                        identity: ClientIdentity::BearerToken(tok_rec.token_id),
+                        scopes,
+                    });
+                }
+
+                // Check Argon2id hashes if any tokens stored as Argon2id
+                if let Ok(all_tokens) = catalog.get_api_tokens() {
+                    for tok_rec in all_tokens {
+                        if tok_rec.token_hash.starts_with("$argon2") {
+                            if let Ok(parsed_hash) = PasswordHash::new(&tok_rec.token_hash) {
+                                if Argon2::default()
+                                    .verify_password(token.as_bytes(), &parsed_hash)
+                                    .is_ok()
+                                {
+                                    let scopes = tok_rec
+                                        .scopes()
+                                        .map_err(|e| AuthError::Hash(e.to_string()))?;
+                                    return Ok(AuthContext {
+                                        identity: ClientIdentity::BearerToken(tok_rec.token_id),
+                                        scopes,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                return Err(AuthError::Unauthorized(
+                    "Invalid or expired API token".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(AuthContext::anonymous())
+}
+
+// Axum FromRequestParts implementation for AuthContext
+impl<S> FromRequestParts<S> for AuthContext
+where
+    S: Send + Sync,
+    Catalog: FromRef<S>,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let catalog = Catalog::from_ref(state);
+        match authenticate_request(parts, &catalog) {
+            Ok(ctx) => Ok(ctx),
+            Err(e) => Err(e.into_response()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+
+    #[test]
+    fn test_token_hashing_and_auth() {
+        let catalog = DuckDbCatalog::in_memory().unwrap();
+        let raw_token = "secret-token-123";
+        let sha_hash = hash_token_sha256(raw_token);
+
+        catalog
+            .insert_api_token(
+                "tok-1",
+                &sha_hash,
+                &[TokenScope::Read, TokenScope::CanaryManage],
+            )
+            .unwrap();
+
+        let req = axum::http::Request::builder()
+            .header(AUTHORIZATION, format!("Bearer {raw_token}"))
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+
+        let auth = authenticate_request(&parts, &catalog).unwrap();
+        assert!(auth.is_authenticated());
+        assert!(auth.has_scope(TokenScope::Read));
+        assert!(auth.has_scope(TokenScope::CanaryManage));
+        assert!(!auth.has_scope(TokenScope::Publish));
+        assert!(auth.require_scope(TokenScope::Read).is_ok());
+        assert!(auth.require_scope(TokenScope::Publish).is_err());
+    }
+
+    #[test]
+    fn test_argon2_token_auth() {
+        let catalog = DuckDbCatalog::in_memory().unwrap();
+        let raw_token = "argon-token-xyz";
+        let argon_hash = hash_token_argon2(raw_token).unwrap();
+
+        catalog
+            .insert_api_token("tok-2", &argon_hash, &[TokenScope::Publish])
+            .unwrap();
+
+        let req = axum::http::Request::builder()
+            .header(AUTHORIZATION, format!("Bearer {raw_token}"))
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+
+        let auth = authenticate_request(&parts, &catalog).unwrap();
+        assert!(auth.is_authenticated());
+        assert!(auth.has_scope(TokenScope::Publish));
+        assert!(!auth.has_scope(TokenScope::Read));
+    }
+
+    #[test]
+    fn test_cert_san_extraction_and_auth() {
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "test-client");
+        params.distinguished_name = dn;
+        params.subject_alt_names = vec![
+            SanType::DnsName("registry.ci.ci.internal".try_into().unwrap()),
+            SanType::URI(
+                "spiffe://cluster.internal/ns/ci/sa/deployer"
+                    .try_into()
+                    .unwrap(),
+            ),
+        ];
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let der = cert.der();
+
+        let sans = extract_cert_sans(der).unwrap();
+        assert_eq!(sans.len(), 2);
+        assert!(sans.contains(&"registry.ci.ci.internal".to_string()));
+
+        let catalog = DuckDbCatalog::in_memory().unwrap();
+        let req = axum::http::Request::builder()
+            .header("x-client-cert-san", "registry.ci.ci.internal")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+
+        let auth = authenticate_request(&parts, &catalog).unwrap();
+        assert!(auth.is_authenticated());
+        assert!(auth.has_scope(TokenScope::Publish));
+        assert!(auth.has_scope(TokenScope::Yank));
+        assert!(auth.has_scope(TokenScope::Read));
+        assert!(auth.has_scope(TokenScope::CanaryManage));
+    }
+
+    #[test]
+    fn test_anonymous_and_invalid_token() {
+        let catalog = DuckDbCatalog::in_memory().unwrap();
+
+        let req_empty = axum::http::Request::builder().body(()).unwrap();
+        let (parts_empty, _) = req_empty.into_parts();
+        let auth = authenticate_request(&parts_empty, &catalog).unwrap();
+        assert!(!auth.is_authenticated());
+        assert!(matches!(
+            auth.require_scope(TokenScope::Read),
+            Err(AuthError::Unauthorized(_))
+        ));
+
+        let req_invalid = axum::http::Request::builder()
+            .header(AUTHORIZATION, "Bearer wrong-token")
+            .body(())
+            .unwrap();
+        let (parts_invalid, _) = req_invalid.into_parts();
+        let res = authenticate_request(&parts_invalid, &catalog);
+        assert!(matches!(res, Err(AuthError::Unauthorized(_))));
+    }
+}
