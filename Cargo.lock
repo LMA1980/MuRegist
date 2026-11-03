@@ -1282,6 +1282,7 @@ dependencies = [
  "bytes",
  "chrono",
  "duckdb",
+ "futures-util",
  "hex",
  "http",
  "http-body-util",

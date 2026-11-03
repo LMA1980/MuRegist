@@ -1,8 +1,11 @@
+use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -23,6 +26,21 @@ pub enum StorageError {
     #[error("Storage conflict: {0}")]
     Conflict(String),
 }
+
+/// Sanitized aggregate Content-Addressed Storage (CAS) health and capacity telemetry.
+/// Intentionally omits all host filesystem paths (`root_dir`, `blobs_dir`, `tmp_dir`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CasStorageHealthSummary {
+    pub total_blobs: u64,
+    pub total_bytes: u64,
+    pub dedup_ratio_bps: u32,
+    pub dedup_savings_bytes: u64,
+    pub last_scrub_epoch_ms: i64,
+    pub corrupted_blobs: u64,
+    pub healthy: bool,
+}
+
+pub type CasStorageSummary = CasStorageHealthSummary;
 
 /// A validated 64-character lowercase hexadecimal SHA-256 digest string.
 #[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -111,6 +129,7 @@ impl TryFrom<String> for Sha256Digest {
 #[derive(Clone, Debug)]
 pub struct CasStore {
     root_dir: PathBuf,
+    dedup_savings_bytes: Arc<AtomicU64>,
 }
 
 pub type CasStorage = CasStore;
@@ -119,6 +138,7 @@ impl CasStore {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         Self {
             root_dir: root_dir.into(),
+            dedup_savings_bytes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -188,6 +208,8 @@ impl CasStore {
                     // Quick check matches, verify contents
                     if let Ok(existing) = tokio::fs::read(&target_path).await {
                         if Sha256Digest::from_bytes(&existing) == digest {
+                            self.dedup_savings_bytes
+                                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                             return Ok(digest);
                         }
                     }
@@ -217,6 +239,8 @@ impl CasStore {
             // Check if concurrent write succeeded
             if tokio::fs::try_exists(&target_path).await.unwrap_or(false) {
                 let _ = tokio::fs::remove_file(&part_path).await;
+                self.dedup_savings_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 return Ok(digest);
             }
             let _ = tokio::fs::remove_file(&part_path).await;
@@ -224,6 +248,68 @@ impl CasStore {
         }
 
         Ok(digest)
+    }
+
+    /// Computes aggregate CAS storage health metrics by scrubbing the two-level SHA-256 blob
+    /// hierarchy (`<blobs_dir>/<hex[0..2]>/<hex>`). Returns zero host filesystem paths.
+    pub async fn storage_health_summary(&self) -> Result<CasStorageHealthSummary, StorageError> {
+        let blobs_root = self.blobs_dir();
+        let mut total_blobs = 0u64;
+        let mut total_bytes = 0u64;
+        let mut corrupted_blobs = 0u64;
+
+        if tokio::fs::try_exists(&blobs_root).await.unwrap_or(false) {
+            let mut prefix_dir = tokio::fs::read_dir(&blobs_root).await?;
+            while let Some(prefix_entry) = prefix_dir.next_entry().await? {
+                let file_type = prefix_entry.file_type().await?;
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let mut shard_dir = tokio::fs::read_dir(prefix_entry.path()).await?;
+                while let Some(blob_entry) = shard_dir.next_entry().await? {
+                    let blob_type = blob_entry.file_type().await?;
+                    if !blob_type.is_file() {
+                        continue;
+                    }
+                    total_blobs += 1;
+                    let file_name = blob_entry.file_name().to_string_lossy().to_string();
+                    match tokio::fs::read(blob_entry.path()).await {
+                        Ok(bytes) => {
+                            total_bytes += bytes.len() as u64;
+                            let computed = Sha256Digest::from_bytes(&bytes);
+                            if computed.as_str() != file_name {
+                                corrupted_blobs += 1;
+                            }
+                        }
+                        Err(_) => {
+                            corrupted_blobs += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let dedup_savings_bytes = self.dedup_savings_bytes.load(Ordering::Relaxed);
+        let logical_bytes = total_bytes.saturating_add(dedup_savings_bytes);
+        let dedup_ratio_bps = dedup_savings_bytes
+            .saturating_mul(10_000)
+            .checked_div(logical_bytes)
+            .unwrap_or(0) as u32;
+
+        Ok(CasStorageHealthSummary {
+            total_blobs,
+            total_bytes,
+            dedup_ratio_bps,
+            dedup_savings_bytes,
+            last_scrub_epoch_ms: Utc::now().timestamp_millis(),
+            corrupted_blobs,
+            healthy: corrupted_blobs == 0,
+        })
+    }
+
+    /// Alias for [`CasStore::storage_health_summary`].
+    pub async fn storage_summary(&self) -> Result<CasStorageSummary, StorageError> {
+        self.storage_health_summary().await
     }
 }
 
@@ -233,7 +319,39 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    #[test]
+    fn test_sha256_digest_validation_and_deterministic_hashing() {
+        let valid_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let digest = Sha256Digest::new(valid_hex).unwrap();
+        assert_eq!(digest.as_str(), valid_hex);
+        assert_eq!(digest.to_string(), valid_hex);
+
+        let empty_digest = Sha256Digest::from_bytes(b"");
+        assert_eq!(empty_digest, digest);
+
+        let payload_digest1 = Sha256Digest::from_bytes(b"MuRegist deterministic CAS test");
+        let payload_digest2 = Sha256Digest::from_bytes(b"MuRegist deterministic CAS test");
+        assert_eq!(payload_digest1, payload_digest2);
+        assert_eq!(payload_digest1.as_str().len(), 64);
+
+        assert!(Sha256Digest::new("short").is_err());
+        assert!(Sha256Digest::new(
+            "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+        )
+        .is_err());
+        assert!(Sha256Digest::new(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        )
+        .is_err());
+
+        let store = CasStore::new("/var/lib/muregist");
+        let blob_path = store.blob_path(valid_hex).unwrap();
+        assert!(blob_path.ends_with(format!("blobs/sha256/e3/{valid_hex}")));
+        assert!(store.blob_path("invalid").is_err());
+    }
+
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_put_get_deduplication() {
         let temp_dir = tempdir().unwrap();
         let store = CasStore::new(temp_dir.path());
@@ -262,6 +380,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_concurrent_writes_identical_payload() {
         let temp_dir = tempdir().unwrap();
         let store = Arc::new(CasStore::new(temp_dir.path()));
@@ -299,6 +418,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_invalid_digest() {
         let temp_dir = tempdir().unwrap();
         let store = CasStore::new(temp_dir.path());
@@ -311,5 +431,49 @@ mod tests {
         .is_err());
         assert!(!store.has_blob("invalid").await);
         assert!(store.get_blob("invalid").await.is_err());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_storage_health_summary_and_corruption_detection() {
+        let temp_dir = tempdir().unwrap();
+        let store = CasStore::new(temp_dir.path());
+        store.init().await.unwrap();
+
+        let empty_summary = store.storage_health_summary().await.unwrap();
+        assert_eq!(empty_summary.total_blobs, 0);
+        assert_eq!(empty_summary.total_bytes, 0);
+        assert_eq!(empty_summary.corrupted_blobs, 0);
+        assert!(empty_summary.healthy);
+
+        let blob_a = b"alpha-blob-payload-bytes";
+        let blob_b = b"beta-blob-payload-bytes-longer";
+        let digest_a = store.put_blob(blob_a).await.unwrap();
+        let _digest_b = store.put_blob(blob_b).await.unwrap();
+        // Deduplicated write of blob_a
+        let _digest_a_dup = store.put_blob(blob_a).await.unwrap();
+
+        let summary = store.storage_summary().await.unwrap();
+        assert_eq!(summary.total_blobs, 2);
+        assert_eq!(summary.total_bytes, (blob_a.len() + blob_b.len()) as u64);
+        assert_eq!(summary.dedup_savings_bytes, blob_a.len() as u64);
+        assert!(summary.dedup_ratio_bps > 0);
+        assert_eq!(summary.corrupted_blobs, 0);
+        assert!(summary.healthy);
+
+        // Ensure serialized JSON never leaks host filesystem path
+        let json_str = serde_json::to_string(&summary).unwrap();
+        assert!(!json_str.contains(&temp_dir.path().to_string_lossy().to_string()));
+
+        // Tamper with blob_a on disk to verify corruption detection
+        let path_a = store.blob_path(digest_a.as_str()).unwrap();
+        tokio::fs::write(&path_a, b"tampered-corrupt-content")
+            .await
+            .unwrap();
+
+        let corrupt_summary = store.storage_health_summary().await.unwrap();
+        assert_eq!(corrupt_summary.total_blobs, 2);
+        assert_eq!(corrupt_summary.corrupted_blobs, 1);
+        assert!(!corrupt_summary.healthy);
     }
 }
