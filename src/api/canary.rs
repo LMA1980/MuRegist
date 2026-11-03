@@ -1,7 +1,9 @@
 use crate::auth::AuthContext;
 use crate::config::AppConfig;
 use crate::storage::cas::CasStore;
-use crate::storage::catalog::{CanaryBundleRecord, DuckDbCatalog, TokenScope};
+use crate::storage::catalog::{
+    validate_w3c_trace_id, CanaryBundleRecord, DuckDbCatalog, TokenScope,
+};
 use axum::{
     extract::{FromRef, FromRequest, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -10,6 +12,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use muobserve_ipc::TraceContext;
 use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -44,6 +47,7 @@ pub struct CreateBundleJsonRequest {
     pub service_name: String,
     pub binary_digest: String,
     pub it_archive_digest: String,
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +55,15 @@ pub struct TaintRequest {
     pub service_name: Option<String>,
     pub node_id: Option<String>,
     pub reason: Option<String>,
+    pub trace_id: Option<String>,
+}
+
+fn extract_trace_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| TraceContext::parse_traceparent(s).ok())
+        .map(|ctx| ctx.trace_id_hex())
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +119,7 @@ async fn create_bundle_handler(
     let mut service_name = String::new();
     let mut binary_digest = String::new();
     let mut it_archive_digest = String::new();
+    let mut explicit_trace_id: Option<String> = None;
 
     if content_type.starts_with("multipart/form-data") {
         let req = match axum::http::Request::builder()
@@ -183,6 +197,11 @@ async fn create_bundle_handler(
                         binary_digest = field.text().await.unwrap_or_default();
                     } else if field_name == "it_archive_digest" {
                         it_archive_digest = field.text().await.unwrap_or_default();
+                    } else if field_name == "trace_id" {
+                        let t = field.text().await.unwrap_or_default();
+                        if !t.trim().is_empty() {
+                            explicit_trace_id = Some(t);
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -220,6 +239,7 @@ async fn create_bundle_handler(
         service_name = parsed.service_name;
         binary_digest = parsed.binary_digest;
         it_archive_digest = parsed.it_archive_digest;
+        explicit_trace_id = parsed.trace_id;
     }
 
     if service_name.trim().is_empty()
@@ -236,6 +256,23 @@ async fn create_bundle_handler(
             .into_response();
     }
 
+    let resolved_trace_id = match explicit_trace_id {
+        Some(raw) => match validate_w3c_trace_id(&raw) {
+            Ok(valid) => Some(valid),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_trace_id",
+                        "message": e.to_string()
+                    })),
+                )
+                    .into_response()
+            }
+        },
+        None => extract_trace_id_from_headers(&headers),
+    };
+
     let bundle_id = format!("bundle-{}", Uuid::new_v4());
     let now = Utc::now().timestamp_millis();
     let bundle = CanaryBundleRecord {
@@ -246,6 +283,7 @@ async fn create_bundle_handler(
         status: "testing".to_string(),
         created_at: now,
         updated_at: now,
+        trace_id: resolved_trace_id,
     };
 
     if let Err(e) = state.catalog.insert_canary_bundle(&bundle) {
@@ -431,6 +469,7 @@ async fn promote_canary_handler(
 async fn taint_canary_handler(
     State(state): State<AppState>,
     auth: AuthContext,
+    headers: HeaderMap,
     Path(digest): Path<String>,
     Json(payload): Json<Option<TaintRequest>>,
 ) -> Response {
@@ -459,7 +498,25 @@ async fn taint_canary_handler(
         service_name: None,
         node_id: None,
         reason: None,
+        trace_id: None,
     });
+
+    let resolved_trace_id = match p.trace_id {
+        Some(raw) => match validate_w3c_trace_id(&raw) {
+            Ok(valid) => Some(valid),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_trace_id",
+                        "message": e.to_string()
+                    })),
+                )
+                    .into_response()
+            }
+        },
+        None => extract_trace_id_from_headers(&headers),
+    };
 
     let service = p
         .service_name
@@ -469,10 +526,13 @@ async fn taint_canary_handler(
         .reason
         .unwrap_or_else(|| "Integration test failure / timeout".to_string());
 
-    if let Err(e) = state
-        .catalog
-        .taint_digest(&digest, &service, &node, &reason)
-    {
+    if let Err(e) = state.catalog.taint_digest_with_trace(
+        &digest,
+        &service,
+        &node,
+        &reason,
+        resolved_trace_id.as_deref(),
+    ) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -485,7 +545,8 @@ async fn taint_canary_handler(
         Json(serde_json::json!({
             "status": "tainted",
             "digest": digest,
-            "reason": reason
+            "reason": reason,
+            "trace_id": resolved_trace_id
         })),
     )
         .into_response()

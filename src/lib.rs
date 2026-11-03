@@ -17,8 +17,11 @@ pub use config::AppConfig;
 pub use frontend::cargo::{cargo_index_relative_path, encode_publish_frame, CargoSparseFrontend};
 pub use frontend::{Maven2Frontend, NuGetV3Frontend, RegistryFrontend};
 pub use storage::{
-    ApiTokenRecord, CanaryBundleRecord, CanaryStatusSummary, CasStorage, CasStore, Catalog,
-    CrateDepRecord, CrateRecord, CrateVersionRecord, DuckDbCatalog, Sha256Digest, StorageError,
+    list_public_packages, sanitize_node_alias, sanitize_public_text, validate_w3c_trace_id,
+    ApiTokenRecord, CanaryBundleRecord, CanaryStatusSummary, CasStorage, CasStorageHealthSummary,
+    CasStorageSummary, CasStore, Catalog, CatalogError, CatalogOverviewCounts, CrateDepRecord,
+    CrateRecord, CrateVersionRecord, DuckDbCatalog, PublicCrateDetail, PublicCrateVersionDetail,
+    PublicPackageSummary, RegistrySseEvent, Sha256Digest, StorageError, TaintRecord,
     TaintedDigestRecord, TokenScope,
 };
 pub use telemetry::{
