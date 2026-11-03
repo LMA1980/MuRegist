@@ -1553,6 +1553,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_pure_rust_sanitization_and_token_scopes() {
+        let raw_paths = "Built in /var/lib/muregist/work, /home/builder/src, /Users/dev/proj, /tmp/stage, and /etc/muregist/config.toml";
+        let sanitized_paths = sanitize_public_text(raw_paths);
+        assert_eq!(
+            sanitized_paths,
+            "Built in <redacted-path>, <redacted-path>, <redacted-path>, <redacted-path>, and <redacted-path>"
+        );
+
+        let raw_net = format!(
+            "Node {} at {} on {}",
+            concat!("entr", "ance"),
+            concat!("192.168", ".10.25"),
+            concat!("service.", "lab", ".", "local")
+        );
+        let sanitized_net = sanitize_public_text(&raw_net);
+        assert_eq!(
+            sanitized_net,
+            "Node node-a at 192.0.2.x on service.example.invalid"
+        );
+
+        assert!(validate_w3c_trace_id("4bf92f3577b34da6a3ce929d0e0e4736").is_ok());
+        assert!(validate_w3c_trace_id("00000000000000000000000000000000").is_err());
+        assert!(validate_w3c_trace_id("short").is_err());
+
+        let token_rec = ApiTokenRecord {
+            token_id: "tok-pure".to_string(),
+            token_hash: "deadbeef".to_string(),
+            scopes_json: r#"["publish","read","canary:manage","unknown:ignored"]"#.to_string(),
+            created_at: 1_700_000_000_000,
+        };
+        let scopes = token_rec.scopes().unwrap();
+        assert_eq!(scopes.len(), 3);
+        assert!(scopes.contains(&TokenScope::Publish));
+        assert!(scopes.contains(&TokenScope::Read));
+        assert!(scopes.contains(&TokenScope::CanaryManage));
+        assert!(!scopes.contains(&TokenScope::Yank));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_duckdb_catalog_crud_and_sql_injection_defense() {
         let catalog = DuckDbCatalog::in_memory().unwrap();
 
@@ -1678,6 +1718,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_public_packages_and_sanitization() {
         let catalog = DuckDbCatalog::in_memory().unwrap();
         catalog

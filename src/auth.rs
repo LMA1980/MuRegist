@@ -92,6 +92,14 @@ pub fn hash_token_argon2(token: &str) -> Result<String, AuthError> {
     Ok(hash.to_string())
 }
 
+/// Verifies a plaintext token string against an Argon2id password hash string.
+pub fn verify_token_argon2(token: &str, token_hash: &str) -> Result<bool, AuthError> {
+    let parsed_hash = PasswordHash::new(token_hash).map_err(|e| AuthError::Hash(e.to_string()))?;
+    Ok(Argon2::default()
+        .verify_password(token.as_bytes(), &parsed_hash)
+        .is_ok())
+}
+
 /// Extracts SAN (Subject Alternative Names) DNS and URI names from a DER-encoded X.509 certificate.
 pub fn extract_cert_sans(cert_der: &[u8]) -> Result<Vec<String>, AuthError> {
     let (_, x509) = X509Certificate::from_der(cert_der)
@@ -307,6 +315,63 @@ mod tests {
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 
     #[test]
+    fn test_pure_rust_sha256_and_auth_context_scopes() {
+        let token = "secret-token-123";
+        let hash1 = hash_token_sha256(token);
+        let hash2 = hash_token_sha256(token);
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 64);
+        assert_ne!(hash1, hash_token_sha256("different-token"));
+
+        let anon = AuthContext::anonymous();
+        assert!(!anon.is_authenticated());
+        assert!(!anon.has_scope(TokenScope::Read));
+        assert!(matches!(
+            anon.require_scope(TokenScope::Read),
+            Err(AuthError::Unauthorized(_))
+        ));
+
+        let mut scopes = HashSet::new();
+        scopes.insert(TokenScope::Read);
+        scopes.insert(TokenScope::CanaryManage);
+        let ctx = AuthContext {
+            identity: ClientIdentity::BearerToken("tok-1".to_string()),
+            scopes,
+        };
+        assert!(ctx.is_authenticated());
+        assert!(ctx.has_scope(TokenScope::Read));
+        assert!(ctx.has_scope(TokenScope::CanaryManage));
+        assert!(!ctx.has_scope(TokenScope::Publish));
+        assert!(ctx.require_scope(TokenScope::Read).is_ok());
+        assert!(matches!(
+            ctx.require_scope(TokenScope::Publish),
+            Err(AuthError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn test_pure_rust_argon2_hash_and_verify() {
+        // Under Miri, verify pre-computed low-cost Argon2id PHC string and round-trip with minimal params
+        let raw_token = "argon-token-xyz";
+        #[cfg(miri)]
+        let hash_str = {
+            let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
+            let params = argon2::Params::new(8, 1, 1, Some(32)).unwrap();
+            let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+            argon2
+                .hash_password(raw_token.as_bytes(), &salt)
+                .unwrap()
+                .to_string()
+        };
+        #[cfg(not(miri))]
+        let hash_str = hash_token_argon2(raw_token).unwrap();
+
+        assert!(verify_token_argon2(raw_token, &hash_str).unwrap());
+        assert!(!verify_token_argon2("wrong-token", &hash_str).unwrap());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_token_hashing_and_auth() {
         let catalog = DuckDbCatalog::in_memory().unwrap();
         let raw_token = "secret-token-123";
@@ -336,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_argon2_token_auth() {
         let catalog = DuckDbCatalog::in_memory().unwrap();
         let raw_token = "argon-token-xyz";
@@ -358,6 +424,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_cert_san_extraction_and_auth() {
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
@@ -395,6 +462,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_anonymous_and_invalid_token() {
         let catalog = DuckDbCatalog::in_memory().unwrap();
 

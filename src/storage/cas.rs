@@ -319,7 +319,39 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    #[test]
+    fn test_sha256_digest_validation_and_deterministic_hashing() {
+        let valid_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let digest = Sha256Digest::new(valid_hex).unwrap();
+        assert_eq!(digest.as_str(), valid_hex);
+        assert_eq!(digest.to_string(), valid_hex);
+
+        let empty_digest = Sha256Digest::from_bytes(b"");
+        assert_eq!(empty_digest, digest);
+
+        let payload_digest1 = Sha256Digest::from_bytes(b"MuRegist deterministic CAS test");
+        let payload_digest2 = Sha256Digest::from_bytes(b"MuRegist deterministic CAS test");
+        assert_eq!(payload_digest1, payload_digest2);
+        assert_eq!(payload_digest1.as_str().len(), 64);
+
+        assert!(Sha256Digest::new("short").is_err());
+        assert!(Sha256Digest::new(
+            "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+        )
+        .is_err());
+        assert!(Sha256Digest::new(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        )
+        .is_err());
+
+        let store = CasStore::new("/var/lib/muregist");
+        let blob_path = store.blob_path(valid_hex).unwrap();
+        assert!(blob_path.ends_with(format!("blobs/sha256/e3/{valid_hex}")));
+        assert!(store.blob_path("invalid").is_err());
+    }
+
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_put_get_deduplication() {
         let temp_dir = tempdir().unwrap();
         let store = CasStore::new(temp_dir.path());
@@ -348,6 +380,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_concurrent_writes_identical_payload() {
         let temp_dir = tempdir().unwrap();
         let store = Arc::new(CasStore::new(temp_dir.path()));
@@ -385,6 +418,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_invalid_digest() {
         let temp_dir = tempdir().unwrap();
         let store = CasStore::new(temp_dir.path());
@@ -400,6 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_storage_health_summary_and_corruption_detection() {
         let temp_dir = tempdir().unwrap();
         let store = CasStore::new(temp_dir.path());
